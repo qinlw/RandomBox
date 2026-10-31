@@ -1,0 +1,57 @@
+{
+  "format_version": "1.10.0",
+  "minecraft:block": {
+    "description": {
+      "identifier": "randombox:random_box",
+      "register_to_creative_menu": true
+    },
+    "components": {
+      "minecraft:destroy_time": {
+        "value": 1.0
+      },
+      "minecraft:explosion_resistance": {
+        "value": 3.0
+      },
+      "minecraft:loot": {
+        "table": "loot_tables/blocks/random_box.json"
+      },
+      "netease:listen_block_remove": {
+        "value": true
+      },
+      "netease:face_directional": {
+        "type": "direction"
+      },
+      "netease:block_entity": {
+        "tick": false,
+        "movable": false
+      },
+      "minecraft:block_light_absorption": 0,
+      "netease:aabb": {
+        "collision": {
+          "min": [
+            0.0625,
+            0,
+            0.0625
+          ],
+          "max": [
+            0.9375,
+            0.875,
+            0.9375
+          ]
+        },
+        "clip": {
+          "min": [
+            0.0625,
+            0,
+            0.0625
+          ],
+          "max": [
+            0.9375,
+            0.875,
+            0.9375
+          ]
+        }
+      }
+    }
+  }
+}

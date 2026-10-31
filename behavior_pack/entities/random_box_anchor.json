@@ -1,0 +1,13 @@
+{
+  "format_version": "1.10.0",
+  "minecraft:entity": {
+    "description": {
+      "identifier": "randombox:random_box_anchor",
+      "is_spawnable": false,
+      "is_summonable": false
+    },
+    "components": {
+      "minecraft:physics": {}
+    }
+  }
+}

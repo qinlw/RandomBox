@@ -1,0 +1,24 @@
+{
+  "format_version": 2,
+  "header": {
+    "name": "随机箱子 RandomBox",
+    "description": "每天自动刷新随机物品的箱子，放置后右键打开，容量与原版箱子一致。",
+    "uuid": "c00d1a1e-d153-4e67-8aae-eb700201bc94",
+    "version": [1, 0, 0],
+    "min_engine_version": [1, 16, 0]
+  },
+  "modules": [
+    {
+      "type": "data",
+      "description": "随机箱子行为包",
+      "uuid": "072b556a-7a11-4d5d-bd2f-39d035cb1228",
+      "version": [1, 0, 0]
+    }
+  ],
+  "dependencies": [
+    {
+      "uuid": "7d74ee8d-f5f3-4997-a61f-89b23bd4b2c7",
+      "version": [1, 0, 0]
+    }
+  ]
+}

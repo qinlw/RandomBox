@@ -1,0 +1,37 @@
+{
+  "format_version": "1.10.0",
+  "animation_controllers": {
+    "controller.animation.randombox_box.general": {
+      "initial_state": "closed",
+      "states": {
+        "closed": {
+          "transitions": [
+            {
+              "open": "variable.rbx_open"
+            }
+          ]
+        },
+        "open": {
+          "animations": [
+            "open"
+          ],
+          "transitions": [
+            {
+              "close": "!variable.rbx_open"
+            }
+          ]
+        },
+        "close": {
+          "animations": [
+            "close"
+          ],
+          "transitions": [
+            {
+              "closed": "query.any_animation_finished"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

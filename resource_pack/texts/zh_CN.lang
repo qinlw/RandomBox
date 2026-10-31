@@ -1,0 +1,3 @@
+tile.randombox:random_box.name=随机箱子
+item.randombox:random_box.name=随机箱子
+tile.randombox:random_box_full.name=随机箱子·已满

@@ -1,0 +1,35 @@
+{
+  "format_version": "1.10.0",
+  "minecraft:client_entity": {
+    "description": {
+      "identifier": "randombox:box_full",
+      "materials": {
+        "default": "entity_alphatest"
+      },
+      "geometry": {
+        "default": "geometry.randombox_box"
+      },
+      "textures": {
+        "default": "textures/entity/randombox/box_full"
+      },
+      "animations": {
+        "fix_scale": "animation.randombox_box.fix_scale",
+        "open": "animation.randombox_box.open",
+        "close": "animation.randombox_box.close",
+        "controller.general": "controller.animation.randombox_box.general"
+      },
+      "scripts": {
+        "initialize": [
+          "variable.rbx_open = 0.0;"
+        ],
+        "animate": [
+          "fix_scale",
+          "controller.general"
+        ]
+      },
+      "render_controllers": [
+        "controller.render.randombox_box"
+      ]
+    }
+  }
+}

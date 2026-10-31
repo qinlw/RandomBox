@@ -1,0 +1,23 @@
+{
+  "format_version": [1, 1, 0],
+  "randombox:random_box": {
+    "sound": "wood",
+    "textures": "randombox_random_box_icon",
+    "client_entity": {
+      "identifier": "randombox:box_normal",
+      "hand_model_use_client_entity": true,
+      "block_icon": "randombox_random_box_icon",
+      "destoryed_textures": "randombox_random_box_icon"
+    }
+  },
+  "randombox:random_box_full": {
+    "sound": "wood",
+    "textures": "randombox_random_box_full_icon",
+    "client_entity": {
+      "identifier": "randombox:box_full",
+      "hand_model_use_client_entity": true,
+      "block_icon": "randombox_random_box_full_icon",
+      "destoryed_textures": "randombox_random_box_full_icon"
+    }
+  }
+}
