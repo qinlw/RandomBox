@@ -4,15 +4,27 @@
     "name": "随机箱子 RandomBox 资源",
     "description": "随机箱子的资源包（方块贴图与容器界面）。",
     "uuid": "7d74ee8d-f5f3-4997-a61f-89b23bd4b2c7",
-    "version": [1, 0, 0],
-    "min_engine_version": [1, 16, 0]
+    "version": [
+      1,
+      0,
+      17
+    ],
+    "min_engine_version": [
+      1,
+      16,
+      0
+    ]
   },
   "modules": [
     {
       "type": "resources",
       "description": "随机箱子资源包",
       "uuid": "5cd95a19-37fb-4290-81d2-05245e7e4a6a",
-      "version": [1, 0, 0]
+      "version": [
+        1,
+        0,
+        17
+      ]
     }
   ]
 }

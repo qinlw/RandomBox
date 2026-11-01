@@ -41,7 +41,28 @@ REFRESH_EVENT = "rbx_test_refresh"
 # 服务端通知箱盖开/合
 BOX_ANIM_EVENT = "rbx_box_anim"
 
-PAGE_SIZE = 12
+# 许愿 / 献祭
+WISH_SET_EVENT = "rbx_wish_set"
+WISH_SAC_EVENT = "rbx_wish_sac"
+WISH_STATE_EVENT = "rbx_wish_state"
+# 与 JSON / 服务端保持一致：容器 27 格放物品，第 28 格（index 27）是献祭格
+CHEST_SLOTS = 27
+SAC_SLOT = 27
+
+# 许愿物品选择弹窗：6 × 4 = 24 格图标（与 UI JSON 里的 cell_0..cell_23 对齐）
+# 测试模式的「查看奖池」复用同一个弹窗，只读展示
+PICK_COLS = 6
+PICK_ROWS = 4
+PICK_CELLS = PICK_COLS * PICK_ROWS
+
+
+def _FmtPct(v):
+    """百分比数值格式化：去掉多余的尾随 0"""
+    try:
+        s = ("%.4f" % float(v)).rstrip("0").rstrip(".")
+    except Exception:
+        s = "0"
+    return s or "0"
 
 
 class RandomBoxClientSystem(ClientSystem):
@@ -54,8 +75,15 @@ class RandomBoxClientSystem(ClientSystem):
         self._pool = []
         self._poolChunks = {}
         self._poolTotal = 0
-        self._poolFilter = ""
-        self._poolPage = 0
+        # 许愿面板状态
+        self._wish = {"item": "", "name": "", "prob": 0.0, "cap": 100}
+        self._iconCache = {}       # 物品 ID -> 图标贴图路径
+        # 许愿物品选择弹窗（测试模式「查看奖池」复用它，此时为只读）
+        self._pickOpen = False
+        self._pickViewMode = False
+        self._pickPage = 0
+        self._pickFilter = ""
+        self._pickEntries = []
 
         engNs = clientApi.GetEngineNamespace()
         engSys = clientApi.GetEngineSystemName()
@@ -71,7 +99,8 @@ class RandomBoxClientSystem(ClientSystem):
 
         for evtName, handler in ((TEST_STATE_EVENT, self.OnTestState),
                                  (POOL_CHUNK_EVENT, self.OnPoolChunk),
-                                 (BOX_ANIM_EVENT, self.OnBoxAnim)):
+                                 (BOX_ANIM_EVENT, self.OnBoxAnim),
+                                 (WISH_STATE_EVENT, self.OnWishState)):
             try:
                 self.ListenForEvent(MOD_NAMESPACE, SERVER_SYSTEM, evtName,
                                     self, handler)
@@ -101,8 +130,8 @@ class RandomBoxClientSystem(ClientSystem):
         if name.startswith(SCREEN_PREFIX):
             self._boxOpen = True
             self._NotifyServer("push", name)
-            if self._testMode:
-                self._ShowTestUI()
+            # 许愿按钮始终可用，测试按钮仅测试模式
+            self._ShowTestUI()
 
     def PopScreenEvent(self, args):
         name = self._ScreenName(args)
@@ -208,16 +237,14 @@ class RandomBoxClientSystem(ClientSystem):
                 bool(self._testMode))
         except Exception as e:
             print("[RandomBox] show test buttons error: %s" % e)
+        # 许愿按钮与弹窗始终接线
+        self._WireWish(node, base)
         if not self._testMode:
             return
         # 挂按钮回调（button_mappings 已在 JSON 里清空，回调走 API）
         wiring = (
             ("/test_buttons/btn_pool", self._OnBtnPool),
             ("/test_buttons/btn_refresh", self._OnBtnRefresh),
-            ("/pool_dialog/btn_search", self._OnBtnSearch),
-            ("/pool_dialog/btn_prev", self._OnBtnPrev),
-            ("/pool_dialog/btn_next", self._OnBtnNext),
-            ("/pool_dialog/btn_close", self._OnBtnClose),
         )
         for path, handler in wiring:
             try:
@@ -231,8 +258,6 @@ class RandomBoxClientSystem(ClientSystem):
     def _HideTestUI(self):
         self._testNode = None
         self._testBase = None
-        self._poolFilter = ""
-        self._poolPage = 0
 
     def OnTestState(self, args):
         enabled = bool(args.get("enabled")) if isinstance(args, dict) else False
@@ -241,8 +266,6 @@ class RandomBoxClientSystem(ClientSystem):
             self._pool = []
             self._poolChunks = {}
             self._poolTotal = 0
-            self._poolFilter = ""
-            self._poolPage = 0
             if self._boxOpen and self._testNode:
                 self._AttachTestUI()
             elif self._boxOpen:
@@ -252,58 +275,18 @@ class RandomBoxClientSystem(ClientSystem):
             if node and base is not None:
                 try:
                     node.GetBaseUIControl(base + "/test_buttons").SetVisible(False)
-                    node.GetBaseUIControl(base + "/pool_dialog").SetVisible(False)
+                    self._ClosePick()
                 except Exception:
                     pass
         print("[RandomBox] test mode: %s" % enabled)
 
     # ---------- 测试按钮回调 ----------
     def _OnBtnPool(self, args):
-        node, base = self._testNode, self._testBase
-        if not node or base is None:
-            return
-        try:
-            node.GetBaseUIControl(base + "/pool_dialog").SetVisible(True)
-        except Exception as e:
-            print("[RandomBox] open pool dialog error: %s" % e)
-        if not self._pool:
-            self.RequestPool()
-        self.RefreshPool()
+        """查看奖池：复用许愿选择弹窗（只读模式）"""
+        self._OpenPick(True)
 
     def _OnBtnRefresh(self, args):
         self.RequestRefresh()
-
-    def _OnBtnSearch(self, args):
-        node, base = self._testNode, self._testBase
-        if not node or base is None:
-            return
-        text = ""
-        try:
-            text = node.GetBaseUIControl(
-                base + "/pool_dialog/search_box").asTextEditBox().GetEditText()
-        except Exception as e:
-            print("[RandomBox] read search box error: %s" % e)
-        self._poolFilter = (text or "").strip()
-        self._poolPage = 0
-        self.RefreshPool()
-
-    def _OnBtnPrev(self, args):
-        if self._poolPage > 0:
-            self._poolPage -= 1
-            self.RefreshPool()
-
-    def _OnBtnNext(self, args):
-        self._poolPage += 1
-        self.RefreshPool()
-
-    def _OnBtnClose(self, args):
-        node, base = self._testNode, self._testBase
-        if not node or base is None:
-            return
-        try:
-            node.GetBaseUIControl(base + "/pool_dialog").SetVisible(False)
-        except Exception:
-            pass
 
     # ---------- 奖池弹窗内容 ----------
     def _SetLabel(self, path, text):
@@ -314,38 +297,6 @@ class RandomBoxClientSystem(ClientSystem):
             node.GetBaseUIControl(base + path).asLabel().SetText(text)
         except Exception as e:
             print("[RandomBox] set label %s error: %s" % (path, e))
-
-    def RefreshPool(self):
-        if not self._testNode or self._testBase is None:
-            return
-        entries = []
-        for it in self._pool:
-            if isinstance(it, dict):
-                iid = it.get("id") or ""
-                cn = it.get("name") or ""
-            else:
-                iid, cn = str(it), ""
-            entries.append((iid, cn))
-        kw = self._poolFilter.lower()
-        if kw:
-            entries = [e for e in entries
-                       if kw in e[0].lower() or kw in e[1].lower()]
-        total = len(self._pool)
-        matched = len(entries)
-        pages = max(1, (matched + PAGE_SIZE - 1) // PAGE_SIZE)
-        if self._poolPage >= pages:
-            self._poolPage = pages - 1
-        start = self._poolPage * PAGE_SIZE
-        lines = []
-        for iid, cn in entries[start:start + PAGE_SIZE]:
-            lines.append("%s  %s" % (iid, cn) if cn else iid)
-        if not lines:
-            lines.append("（无匹配物品）" if self._pool else "（奖池加载中…）")
-        self._SetLabel("/pool_dialog/title_label",
-                       "奖池：共 %d 个物品（匹配 %d）" % (total, matched))
-        self._SetLabel("/pool_dialog/list_label", "\n".join(lines))
-        self._SetLabel("/pool_dialog/page_label",
-                       "%d/%d" % (self._poolPage + 1, pages))
 
     # ---------- 奖池数据 ----------
     def OnPoolChunk(self, args):
@@ -369,7 +320,7 @@ class RandomBoxClientSystem(ClientSystem):
         self._pool = pool
         self._poolChunks = {}
         print("[RandomBox] pool received items=%d" % len(pool))
-        self.RefreshPool()
+        self.RefreshPick()
 
     def GetPool(self):
         return self._pool
@@ -387,3 +338,292 @@ class RandomBoxClientSystem(ClientSystem):
                 "playerId": clientApi.GetLocalPlayerId()})
         except Exception as e:
             print("[RandomBox] request refresh error: %s" % e)
+
+    # ---------- 许愿 / 献祭面板 ----------
+    def _WireWish(self, node, base):
+        """许愿面板与献祭按钮接线（与测试模式无关，始终生效）"""
+        wiring = [
+            ("/wish_panel/btn_wish", self._OnBtnWish),
+            ("/wish_panel/btn_sacrifice", self._OnBtnSacrifice),
+            ("/pick_dialog/btn_close", self._OnBtnPickClose),
+            ("/pick_dialog/btn_search", self._OnBtnPickSearch),
+            ("/pick_dialog/btn_prev", self._OnBtnPickPrev),
+            ("/pick_dialog/btn_next", self._OnBtnPickNext),
+        ]
+        for i in range(PICK_CELLS):
+            wiring.append(("/pick_dialog/cell_%d" % i, self._PickHandler(i)))
+        for path, handler in wiring:
+            try:
+                btn = node.GetBaseUIControl(base + path).asButton()
+                btn.AddTouchEventParams({"isSwallow": True})
+                btn.SetButtonTouchUpCallback(handler)
+            except Exception as e:
+                print("[RandomBox] wire wish %s error: %s" % (path, e))
+        print("[RandomBox] wish controls attached")
+        self._SetGridVisible(True)
+        self.RefreshWish()
+
+    def _ShowControl(self, path, show):
+        node, base = self._testNode, self._testBase
+        if not node or base is None:
+            return
+        try:
+            node.GetBaseUIControl(base + path).SetVisible(bool(show))
+        except Exception:
+            pass
+
+    # 物品格的数量角标属于 container_item 模板的深层控件，层级高于弹窗，
+    # 打开弹窗时直接隐藏物品网格，避免「数字浮在弹窗上」
+    GRID_PATHS = (
+        "/randombox_panel/root_panel/common_panel/bg_image/chest_panel"
+        "/randombox_panel_top_half/randombox_grid1",
+    )
+
+    def _SetGridVisible(self, show):
+        node, base = self._testNode, self._testBase
+        if not node or base is None:
+            return
+        for path in self.GRID_PATHS:
+            try:
+                ctrl = node.GetBaseUIControl(base + path)
+            except Exception:
+                ctrl = None
+            if not ctrl:
+                continue
+            try:
+                ctrl.SetVisible(bool(show))
+            except Exception as e:
+                print("[RandomBox] grid visible error: %s" % e)
+            return
+        print("[RandomBox] grid control not found: %s" % (self.GRID_PATHS[0],))
+
+    # ---------- 许愿物品选择弹窗 ----------
+    def _OnBtnWish(self, args):
+        self._OpenPick()
+
+    def _OpenPick(self, viewMode=False):
+        node, base = self._testNode, self._testBase
+        if not node or base is None:
+            return
+        self._pickOpen = True
+        self._pickViewMode = bool(viewMode)
+        self._pickPage = 0
+        self._pickFilter = ""
+        try:
+            node.GetBaseUIControl(
+                base + "/pick_dialog/search_box").asTextEditBox().SetEditText("")
+        except Exception:
+            pass
+        try:
+            node.GetBaseUIControl(base + "/pick_dialog").SetVisible(True)
+        except Exception as e:
+            print("[RandomBox] open pick error: %s" % e)
+        # 隐藏物品网格：否则格子里的数量角标会浮在弹窗上面
+        self._SetGridVisible(False)
+        if not self._pool:
+            self.RequestPool()
+        self.RefreshPick()
+
+    def _ClosePick(self):
+        node, base = self._testNode, self._testBase
+        self._pickOpen = False
+        self._pickViewMode = False
+        self._SetGridVisible(True)
+        if not node or base is None:
+            return
+        try:
+            node.GetBaseUIControl(base + "/pick_dialog").SetVisible(False)
+        except Exception:
+            pass
+
+    def _OnBtnPickClose(self, args):
+        self._ClosePick()
+
+    def _OnBtnPickSearch(self, args):
+        node, base = self._testNode, self._testBase
+        if not node or base is None:
+            return
+        text = ""
+        try:
+            text = node.GetBaseUIControl(
+                base + "/pick_dialog/search_box").asTextEditBox().GetEditText()
+        except Exception as e:
+            print("[RandomBox] read pick search error: %s" % e)
+        self._pickFilter = (text or "").strip()
+        self._pickPage = 0
+        self.RefreshPick()
+
+    def _OnBtnPickPrev(self, args):
+        if self._pickPage > 0:
+            self._pickPage -= 1
+            self.RefreshPick()
+
+    def _OnBtnPickNext(self, args):
+        self._pickPage += 1
+        self.RefreshPick()
+
+    def _PickHandler(self, index):
+        def handler(args):
+            if self._pickViewMode:
+                return
+            pos = self._pickPage * PICK_CELLS + index
+            if pos >= len(self._pickEntries):
+                return
+            iid = self._pickEntries[pos][0]
+            try:
+                self.NotifyToServer(WISH_SET_EVENT, {
+                    "playerId": clientApi.GetLocalPlayerId(), "item": iid})
+            except Exception as e:
+                print("[RandomBox] wish set error: %s" % e)
+            self._ClosePick()
+        return handler
+
+    def RefreshPick(self):
+        if not self._pickOpen:
+            return
+        if not self._pool:
+            self._pickEntries = []
+        else:
+            kw = self._pickFilter.lower()
+            entries = []
+            for it in self._pool:
+                if isinstance(it, dict):
+                    iid = it.get("id") or ""
+                    cn = it.get("name") or ""
+                else:
+                    iid, cn = str(it), ""
+                if not iid:
+                    continue
+                if kw and kw not in iid.lower() and kw not in cn.lower():
+                    continue
+                entries.append((iid, cn))
+            self._pickEntries = entries
+        total = len(self._pickEntries)
+        pages = max(1, (total + PICK_CELLS - 1) // PICK_CELLS)
+        if self._pickPage >= pages:
+            self._pickPage = pages - 1
+        start = self._pickPage * PICK_CELLS
+        for i in range(PICK_CELLS):
+            pos = start + i
+            iid = self._pickEntries[pos][0] if pos < total else ""
+            if iid:
+                self._ShowControl("/pick_dialog/cell_%d/icon" % i, True)
+                self._SetIcon("/pick_dialog/cell_%d/icon" % i, iid)
+            else:
+                self._ShowControl("/pick_dialog/cell_%d/icon" % i, False)
+        self._SetLabel("/pick_dialog/title_label",
+                       ("奖池：%d 个物品" if self._pickViewMode
+                        else "选择许愿物品（%d）") % total)
+        self._SetLabel("/pick_dialog/page_label",
+                       "第 %d/%d 页" % (self._pickPage + 1, pages))
+        if not self._pool:
+            self._SetLabel("/pick_dialog/hint_label", "奖池加载中…")
+        elif total == 0:
+            self._SetLabel("/pick_dialog/hint_label", "没有匹配的物品")
+        elif self._pickViewMode:
+            self._SetLabel("/pick_dialog/hint_label", "只读查看，点「关闭」返回")
+        else:
+            self._SetLabel("/pick_dialog/hint_label", "点图标即设为许愿物品")
+
+    # ---- 物品图标 ----
+    def _ItemIcon(self, name):
+        """把物品 ID 解析成贴图路径；取不到时返回空串（控件隐藏）"""
+        if not name:
+            return ""
+        if name in self._iconCache:
+            return self._iconCache[name]
+        factory = clientApi.GetEngineCompFactory()
+        tex = ""
+        for entId in (clientApi.GetLocalPlayerId(), clientApi.GetLevelId()):
+            comp = None
+            try:
+                comp = factory.CreateItem(entId)
+            except Exception:
+                continue
+            if comp is None:
+                continue
+            for call in (lambda: comp.GetItemTexture(name, 0),
+                         lambda: comp.GetItemTexture(name)):
+                try:
+                    got = call()
+                except Exception:
+                    got = None
+                if isinstance(got, _STRING_TYPES) and got:
+                    tex = got
+                    break
+            if tex:
+                break
+            try:
+                info = comp.GetItemBasicInfo(name, 0)
+            except Exception:
+                info = None
+            if isinstance(info, dict):
+                for key in ("iconPath", "texture", "texturePath"):
+                    val = info.get(key)
+                    if isinstance(val, _STRING_TYPES) and val:
+                        tex = val
+                        break
+            if tex:
+                break
+        if tex and not tex.startswith("textures/"):
+            tex = "textures/" + tex
+        self._iconCache[name] = tex
+        return tex
+
+    def _SetIcon(self, path, name, show_if_missing=False):
+        node, base = self._testNode, self._testBase
+        if not node or base is None:
+            return
+        tex = self._ItemIcon(name)
+        if not tex:
+            self._ShowControl(path, show_if_missing)
+            return
+        try:
+            self._ShowControl(path, True)
+            node.GetBaseUIControl(base + path).asImage().SetSprite(tex)
+        except Exception as e:
+            print("[RandomBox] set icon %s error: %s" % (path, e))
+
+    # ---- 面板按钮 ----
+    def _OnBtnSacrifice(self, args):
+        if not (self._wish.get("item") or ""):
+            self._SetLabel("/wish_panel/wish_name_label", "先选许愿物品")
+            return
+        try:
+            self.NotifyToServer(WISH_SAC_EVENT, {
+                "playerId": clientApi.GetLocalPlayerId()})
+        except Exception as e:
+            print("[RandomBox] sacrifice error: %s" % e)
+
+    # ---- 服务端数据下发 ----
+    def OnWishState(self, args):
+        if not isinstance(args, dict):
+            return
+        self._wish = {
+            "item": args.get("item") or "",
+            "name": args.get("name") or "",
+            "prob": args.get("prob") or 0.0,
+            "cap": args.get("cap", 100),
+        }
+        self.RefreshWish()
+
+    # ---- 面板刷新 ----
+    def RefreshWish(self):
+        if not self._testNode or self._testBase is None:
+            return
+        w = self._wish
+        item = w.get("item") or ""
+        if item:
+            self._SetLabel("/wish_panel/wish_name_label",
+                           w.get("name") or item)
+            self._SetIcon("/wish_panel/btn_wish/icon", item)
+        else:
+            self._SetLabel("/wish_panel/wish_name_label", "点图标选许愿")
+            self._ShowControl("/wish_panel/btn_wish/icon", False)
+        try:
+            cap = int(w.get("cap", 100))
+        except Exception:
+            cap = 100
+        self._SetLabel("/wish_panel/prob_label",
+                       "累计 %s％" % _FmtPct(w.get("prob", 0.0)))
+        self._SetLabel("/wish_panel/cap_label", "上限 %d％" % cap)

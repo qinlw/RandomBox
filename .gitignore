@@ -361,3 +361,6 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+
+# 临时备份目录（仅仓库根目录这一个，不影响其它同名文件夹）
+/_backup/

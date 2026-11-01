@@ -41,7 +41,10 @@ BLOCK_FULL_ID = "randombox:random_box_full"
 BLOCK_IDS = (BLOCK_ID, BLOCK_FULL_ID)
 
 ITEMS_PER_DAY = 1
-MAX_SLOTS = 27
+# 容器共 28 格：0..26 是箱子物品，第 28 格（index 27）是独立的献祭格，
+# 在 UI 里渲染成容器网格右下角那一格。许愿物品不占格子，从奖池弹窗里选。
+CHEST_SLOTS = 27
+SAC_SLOT = 27         # 第 28 格：物品留在这里，点「献祭」才消耗
 DAY_TICKS = 24000
 # 容器界面持续打开超过这个秒数就不再阻止满/未满外观切换
 OPEN_STATE_TIMEOUT = 20.0
@@ -65,7 +68,25 @@ TEST_POOL_CHUNK_EVENT = "rbx_test_pool_chunk"
 TEST_POOL_REQUEST_EVENT = "rbx_test_pool_request"
 TEST_REFRESH_EVENT = "rbx_test_refresh"
 TEST_POOL_CHUNK_SIZE = 150
+
+# 许愿 / 献祭（概率与上限为全世界共享，所有随机箱子共用一份）
+WISH_SET_EVENT = "rbx_wish_set"        # 客户端在奖池弹窗里选定了许愿物品
+WISH_SAC_EVENT = "rbx_wish_sac"        # 献祭献祭格内的一组物品
+WISH_STATE_EVENT = "rbx_wish_state"    # 服务端下发许愿状态
+WISH_CAP_MAX = 100     # 初始许愿上限 100%
+WISH_CAP_STEP = 20     # 许愿命中一次，上限 -20%
+SAC_BASE = 5.0         # 某种物品第一次献祭提升 5%
+SAC_MIN_GAIN = 1e-4    # 单次提升低于该值视为 0，避免无限小数值累积导致溢出
 # ==================================
+
+
+def _FmtPct(v):
+    """百分比数值格式化：去掉多余的尾随 0"""
+    try:
+        s = ("%.4f" % float(v)).rstrip("0").rstrip(".")
+    except Exception:
+        s = "0"
+    return s or "0"
 
 _levelId = None
 
@@ -99,6 +120,9 @@ class RandomBoxServerSystem(ServerSystem):
         self._openTime = {}       # playerId -> 打开界面的时间
         self._syncPending = set()
         self._useGuard = {}
+        # 右键随机箱子之后的一小段时间内，禁止使用/放置手中物品
+        # （与 _useGuard 分开：_useGuard 只用于开箱节流，混用会把自己的开箱事件挡掉）
+        self._itemGuard = {}
         self._timerId = None
         self._pool = []            # 运行时物品奖池
         self._stackCache = {}      # 物品最大堆叠数缓存
@@ -109,6 +133,12 @@ class RandomBoxServerSystem(ServerSystem):
         self._pendingPlace = {}    # playerId -> 即将放置的箱子物品 extraId
         self._statePending = set() # 需要核对满/未满外观的箱子 key
         self._dirty = False
+        # 许愿状态（全世界共享）：
+        #   item 许愿物品 ID；prob 已积累概率(%)；cap 当前上限(%)；
+        #   sac  每种物品已献祭数量（决定递减档位）
+        self._wish = {"item": "", "prob": 0.0, "cap": WISH_CAP_MAX, "sac": {}}
+        # 每个玩家的献祭格内容（物品从背包移到这里，关界面或取回时退回背包）
+        self._sacStash = {}
 
         # 任何一步失败都不能影响系统注册，否则所有事件和定时器都不会生效
         try:
@@ -141,7 +171,8 @@ class RandomBoxServerSystem(ServerSystem):
     def _ListenEngineEvents(self):
         engNs = serverApi.GetEngineNamespace()
         engSys = serverApi.GetEngineSystemName()
-        for evtName in ("ServerItemTryUseEvent", "ServerItemUseOnEvent",
+        for evtName in ("ServerItemUseOnEvent",
+                        "ServerEntityTryPlaceBlockEvent",
                         "ServerChatEvent", "CommandEvent",
                         "ServerBlockUseEvent",
                         "EntityPlaceBlockAfterServerEvent",
@@ -161,9 +192,11 @@ class RandomBoxServerSystem(ServerSystem):
                                 self, self.OnScreenEvent)
         except Exception as e:
             print("[RandomBox] listen screen event error: %s" % e)
-        # 测试面板请求
+        # 测试面板请求 / 许愿面板请求
         for evtName, handler in ((TEST_POOL_REQUEST_EVENT, self.OnTestPoolRequest),
-                                 (TEST_REFRESH_EVENT, self.OnTestRefresh)):
+                                 (TEST_REFRESH_EVENT, self.OnTestRefresh),
+                                 (WISH_SET_EVENT, self.OnWishSet),
+                                 (WISH_SAC_EVENT, self.OnWishSacrifice)):
             try:
                 self.ListenForEvent(MOD_NAMESPACE, CLIENT_SYSTEM, evtName,
                                     self, handler)
@@ -252,6 +285,9 @@ class RandomBoxServerSystem(ServerSystem):
                 boxes = data.get("boxes")
                 if isinstance(boxes, dict):
                     self._boxes = boxes
+                wish = data.get("wish")
+                if isinstance(wish, dict):
+                    self._wish = self._CleanWish(wish)
         self._PruneBoxes()
         # 存档里已有的箱子先排队核对一次外观（上次可能没来得及切满箱贴图）
         for key in list(self._chests.keys()):
@@ -263,12 +299,44 @@ class RandomBoxServerSystem(ServerSystem):
         try:
             ok = CompFactory.CreateExtraData(_LevelId()).SetExtraData(
                 WORLD_KEY, json.dumps({"chests": self._chests,
-                                       "boxes": self._boxes}))
+                                       "boxes": self._boxes,
+                                       "wish": self._wish}))
             if not ok:
                 print("[RandomBox] world SetExtraData returned False")
         except Exception as e:
             print("[RandomBox] world SetExtraData error:", e)
         self._dirty = False
+
+    @staticmethod
+    def _CleanWish(raw):
+        """校验存档中的许愿数据，非法字段回退默认值，防止脏数据溢出"""
+        wish = {"item": "", "prob": 0.0, "cap": WISH_CAP_MAX, "sac": {}}
+        item = raw.get("item")
+        if isinstance(item, _STRING_TYPES):
+            wish["item"] = item
+        try:
+            wish["prob"] = min(float(WISH_CAP_MAX),
+                               max(0.0, round(float(raw.get("prob") or 0.0), 4)))
+        except Exception:
+            pass
+        try:
+            wish["cap"] = min(WISH_CAP_MAX, max(0, int(raw.get("cap", WISH_CAP_MAX))))
+        except Exception:
+            pass
+        sac = raw.get("sac")
+        if isinstance(sac, dict):
+            clean = {}
+            for k, v in sac.items():
+                if not isinstance(k, _STRING_TYPES) or not k:
+                    continue
+                try:
+                    n = int(v)
+                except Exception:
+                    continue
+                if n > 0:
+                    clean[k] = min(n, 1000000)
+            wish["sac"] = clean
+        return wish
 
     def _PruneBoxes(self):
         """清理长时间没被重新放置的箱子记录，避免 ExtraData 无限增长"""
@@ -444,22 +512,26 @@ class RandomBoxServerSystem(ServerSystem):
             out["extraId"] = eid
         return out
 
-    @staticmethod
-    def _Bag(state):
-        """箱子内容：dict，键为槽位号字符串，值为物品字典"""
+    def _Bag(self, state):
+        """箱子内容：dict，键为槽位号字符串，值为物品字典（只保留 0..26 号箱子格）"""
         bag = state.get("bag")
-        if isinstance(bag, dict):
-            return bag
+        out = {}
         if isinstance(bag, list):
-            out = {}
             for i, it in enumerate(bag):
-                if isinstance(it, dict) and _ItemName(it):
+                if i < CHEST_SLOTS and isinstance(it, dict) and _ItemName(it):
                     out[str(i)] = it
-            return out
-        return {}
+        elif isinstance(bag, dict):
+            for k, it in bag.items():
+                try:
+                    slot = int(k)
+                except Exception:
+                    continue
+                if 0 <= slot < CHEST_SLOTS and isinstance(it, dict) and _ItemName(it):
+                    out[str(slot)] = it
+        return out
 
     @staticmethod
-    def _BagAdd(bag, item, size=MAX_SLOTS):
+    def _BagAdd(bag, item, size=CHEST_SLOTS):
         """把物品放入第一个空槽位；满则返回 False"""
         for slot in range(size):
             if str(slot) not in bag:
@@ -513,6 +585,186 @@ class RandomBoxServerSystem(ServerSystem):
 
     def _RollItem(self):
         return loot_pool.RollItem(self._EnsurePool(), self._MaxStack)
+
+    # ---------- 许愿 / 献祭 ----------
+    def _WishProb(self):
+        """当前生效概率：积累概率不超过上限，二者皆非法时按 0 处理"""
+        try:
+            cap = int(self._wish.get("cap", WISH_CAP_MAX))
+        except Exception:
+            cap = WISH_CAP_MAX
+        cap = min(WISH_CAP_MAX, max(0, cap))
+        if cap <= 0:
+            return 0.0, 0
+        try:
+            prob = float(self._wish.get("prob") or 0.0)
+        except Exception:
+            prob = 0.0
+        prob = min(max(prob, 0.0), float(cap))
+        return prob, cap
+
+    def _WishPayload(self):
+        prob, cap = self._WishProb()
+        item = self._wish.get("item") or ""
+        return {"item": item,
+                "name": self._ItemCn(item) if item else "",
+                "prob": round(prob, 4), "cap": cap}
+
+    def _SendWishState(self, playerId=None):
+        payload = self._WishPayload()
+        try:
+            if playerId:
+                self.NotifyToClient(playerId, WISH_STATE_EVENT, payload)
+            else:
+                self.BroadcastToAllClient(WISH_STATE_EVENT, payload)
+        except Exception as e:
+            print("[RandomBox] send wish state error:", e)
+
+    def _SaveWish(self):
+        self._dirty = True
+        self._SaveWorld()
+
+    def _SacGain(self, name, count):
+        """献祭 count 个 name 能提升的概率：第 n 个提升 5%*(1/2)^(n-1)，
+        单次增量过小视为 0，且总量不超过当前上限的剩余空间"""
+        prob, cap = self._WishProb()
+        if cap <= 0:
+            return 0.0
+        sac = self._wish.get("sac")
+        n = 0
+        if isinstance(sac, dict):
+            try:
+                n = int(sac.get(name, 0))
+            except Exception:
+                n = 0
+        gain = 0.0
+        try:
+            count = max(0, int(count))
+        except Exception:
+            count = 0
+        for i in range(count):
+            inc = SAC_BASE * (0.5 ** (n + i))
+            if inc < SAC_MIN_GAIN:
+                break
+            gain += inc
+        headroom = float(cap) - prob
+        return min(gain, max(0.0, headroom))
+
+    def _RollDaily(self):
+        """每日刷新抽取：先按许愿概率判定，未命中再走普通随机"""
+        item = self._RollWish()
+        if item is not None:
+            return item
+        return self._RollItem()
+
+    def _RollWish(self):
+        """许愿判定：命中则产出许愿物品，积累概率清零、上限 -20，献祭记录保留"""
+        name = self._wish.get("item") or ""
+        if not name:
+            return None
+        prob, cap = self._WishProb()
+        if prob <= 0.0:
+            return None
+        if random.random() * 100.0 >= prob:
+            return None
+        # 命中：只清积累概率，sac（每种物品已献祭的数量）继续保留，
+        # 所以下一块铁锭只涨 1.25% 而不是重新回到 5%
+        self._wish["prob"] = 0.0
+        self._wish["cap"] = max(0, cap - WISH_CAP_STEP)
+        self._SaveWish()
+        cn = self._ItemCn(name) or name
+        msg = "[随机箱子] 许愿成功！%s 已刷新，积累概率已清零，许愿上限降至 %d%%" % (
+            cn, self._wish["cap"])
+        for playerId in serverApi.GetPlayerList():
+            self._Notify(playerId, msg)
+        print("[RandomBox] wish hit %s, cap -> %d" % (name, self._wish["cap"]))
+        self._SendWishState()
+        return loot_pool.MakeItem(name, self._MaxStack)
+
+    def _ReturnSacStash(self, playerId):
+        """把献祭格里暂存的物品退回玩家背包"""
+        it = self._sacStash.pop(playerId, None)
+        if not isinstance(it, dict) or not _ItemName(it):
+            return False
+        try:
+            CompFactory.CreateItem(playerId).SpawnItemToPlayerInv(
+                self._CleanItem(it), playerId)
+        except Exception as e:
+            print("[RandomBox] return sac stash error:", e)
+            self._sacStash[playerId] = it
+            return False
+        return True
+
+    def OnWishSacrifice(self, args):
+        """献祭容器第 28 格（献祭格）里的整组物品，按递减规则提升许愿概率"""
+        try:
+            playerId = args.get("playerId")
+            if not playerId:
+                return
+            if not (self._wish.get("item") or ""):
+                self._Notify(playerId, "[随机箱子] 请先设置许愿物品再献祭")
+                return
+            prob, cap = self._WishProb()
+            if cap <= 0:
+                self._Notify(playerId, "[随机箱子] 许愿上限已归零，无法继续献祭")
+                return
+            comp = CompFactory.CreateItem(playerId)
+            it = None
+            readOk = False
+            try:
+                it = comp.GetPlayerUIItem(playerId, SAC_SLOT, True, True)
+                readOk = True
+            except Exception as e:
+                print("[RandomBox] read sac slot error:", e)
+            if readOk:
+                if isinstance(it, dict) and _ItemName(it):
+                    self._sacStash.pop(playerId, None)
+                    try:
+                        comp.SetPlayerUIItem(playerId, SAC_SLOT, None, False, True)
+                    except Exception as e:
+                        print("[RandomBox] clear sac slot error:", e)
+                else:
+                    it = None
+                    self._sacStash.pop(playerId, None)
+            else:
+                it = self._sacStash.pop(playerId, None)
+            if not isinstance(it, dict) or not _ItemName(it):
+                self._Notify(playerId, "[随机箱子] 献祭格是空的，请先把物品放到容器右下角那一格")
+                return
+            name = _ItemName(it)
+            try:
+                count = max(1, int(it.get("count", 1)))
+            except Exception:
+                count = 1
+            self._ApplySacrifice(playerId, name, count)
+        except Exception as e:
+            print("[RandomBox] wish sacrifice error:", e)
+
+    def _ApplySacrifice(self, playerId, name, count):
+        """物品已扣除后的统一结算：累计献祭数量、提升概率、刷新界面"""
+        prob, cap = self._WishProb()
+        gain = round(self._SacGain(name, count), 4)
+        sac = self._wish.get("sac")
+        if not isinstance(sac, dict):
+            sac = {}
+            self._wish["sac"] = sac
+        try:
+            sac[name] = int(sac.get(name, 0)) + count
+        except Exception:
+            sac[name] = count
+        self._wish["prob"] = round(min(prob + gain, float(cap)), 4)
+        self._SaveWish()
+        cn = self._ItemCn(name) or name
+        if gain > 0:
+            self._Notify(playerId,
+                         "[随机箱子] 献祭 %s x%d：概率 +%s%%（当前 %s%%/%d%%）"
+                         % (cn, count, _FmtPct(gain),
+                            _FmtPct(self._wish["prob"]), cap))
+        else:
+            self._Notify(playerId,
+                         "[随机箱子] 献祭 %s x%d：提升已达上限，概率不变"
+                         % (cn, count))
+        self._SendWishState(playerId)
 
     # ---------- 测试模式 ----------
     def ServerChatEvent(self, args):
@@ -583,7 +835,8 @@ class RandomBoxServerSystem(ServerSystem):
         except Exception as e:
             print("[RandomBox] notify test state error:", e)
 
-    def _PoolEntry(self, name):
+    def _ItemCn(self, name):
+        """物品本地化名称（带缓存），取不到返回空串"""
         cn = self._nameCache.get(name)
         if cn is None:
             cn = ""
@@ -594,7 +847,10 @@ class RandomBoxServerSystem(ServerSystem):
             except Exception:
                 pass
             self._nameCache[name] = cn
-        return {"id": name, "name": cn}
+        return cn
+
+    def _PoolEntry(self, name):
+        return {"id": name, "name": self._ItemCn(name)}
 
     def _SendPoolChunks(self, playerId):
         pool = self._EnsurePool()
@@ -615,12 +871,13 @@ class RandomBoxServerSystem(ServerSystem):
               % (playerId, len(pool), total))
 
     def OnTestPoolRequest(self, args):
+        """奖池请求：选择弹窗用它拉取可许愿物品，不再限制测试模式"""
         try:
             playerId = args.get("playerId")
-            if playerId and playerId in self._testMode:
+            if playerId:
                 self._SendPoolChunks(playerId)
         except Exception as e:
-            print("[RandomBox] test pool request error:", e)
+            print("[RandomBox] pool request error:", e)
 
     def OnTestRefresh(self, args):
         try:
@@ -631,30 +888,38 @@ class RandomBoxServerSystem(ServerSystem):
             print("[RandomBox] test refresh error:", e)
 
     def _TestRefresh(self, playerId):
-        """立即模拟一次每日刷新：给当前打开的箱子加 1 件物品"""
+        """模拟 /time add 24000：把游戏日推进一天，走真实的每日刷新流程"""
+        day = self._ClockDay()
+        if day is None:
+            self._Notify(playerId, "[随机箱子] 测试：读不到世界时间")
+            return
+        # 让 _ClockDay 的兜底基准也前进一天，这样「当前游戏日」真的 +1
+        self._rtBase = time.time()
+        self._rtBaseDay = day + 1
+        day = self._ClockDay()
+        self._lastDay = day
+        self._lastScan = time.time()
+        count = self._RefreshAll(day)
         key = self._openChest.get(playerId)
-        if not key or key not in self._chests:
-            self._Notify(playerId, "[随机箱子] 测试：请先打开一个随机箱子")
-            return
-        state = self._chests[key]
-        bag = self._Bag(state)
-        if len(bag) >= MAX_SLOTS:
-            self._Notify(playerId, "[随机箱子] 测试：箱子已满")
-            return
-        self._BagAdd(bag, self._RollItem())
-        state["bag"] = bag
-        self._dirty = True
-        self._SaveWorld()
-        self._Notify(playerId, "[随机箱子] 测试刷新 +1 (%d/%d)" %
-                     (len(bag), MAX_SLOTS))
-        self._PushBagToUI(playerId, bag)
-        self._MarkState(key)
+        state = self._chests.get(key) if key else None
+        if isinstance(state, dict) and len(self._Bag(state)) >= CHEST_SLOTS:
+            self._Notify(playerId, "[随机箱子] 箱子已满，今天不刷新")
+        self._Notify(playerId, "[随机箱子] 测试：模拟过了一天（第 %d 天），%d 个箱子刷新"
+                     % (day, count))
 
     # ---------- 放置 / 破坏 ----------
     def ServerItemUseOnEvent(self, args):
         """放置随机箱子前，记录该物品携带的箱子内容标识"""
         try:
             if not isinstance(args, dict):
+                return
+            if args.get("blockName") in BLOCK_IDS:
+                # 右键的是随机箱子：取消本次物品使用，
+                # 否则开箱的同时手中方块会被摆到箱子旁边
+                playerId = args.get("entityId") or args.get("playerId")
+                if playerId:
+                    self._itemGuard[playerId] = time.time()
+                args["cancel"] = True
                 return
             it = args.get("itemDict") or {}
             if _ItemName(it) != BLOCK_ID:
@@ -834,7 +1099,7 @@ class RandomBoxServerSystem(ServerSystem):
         if self._IsChestOpen(key):
             return False
         bag = self._Bag(state)
-        want = BLOCK_FULL_ID if len(bag) >= MAX_SLOTS else BLOCK_ID
+        want = BLOCK_FULL_ID if len(bag) >= CHEST_SLOTS else BLOCK_ID
         dim = state.get("dim", 0)
         x, y, z = state.get("x"), state.get("y"), state.get("z")
         if None in (x, y, z):
@@ -898,6 +1163,8 @@ class RandomBoxServerSystem(ServerSystem):
                 return
             if args.get("blockName") not in BLOCK_IDS:
                 return
+            # 取消默认交互，避免开箱的同时放置手中方块（部分引擎版本走此事件）
+            args["cancel"] = True
             playerId = args.get("playerId")
             if not playerId:
                 return
@@ -914,6 +1181,26 @@ class RandomBoxServerSystem(ServerSystem):
             self._OpenChest(playerId, dim, x, y, z)
         except Exception as e:
             print("[RandomBox] block use error:", e)
+
+    def ServerEntityTryPlaceBlockEvent(self, args):
+        """兜底：刚与随机箱子交互过时不允许放下手中方块
+
+        部分引擎版本在 ServerItemUseOnEvent 中设 cancel 无效，方块仍会被放置，
+        这里按“同一玩家 + 极短窗口”再做一次拦截。
+        """
+        try:
+            if not isinstance(args, dict):
+                return
+            if args.get("blockName") in BLOCK_IDS:
+                return
+            playerId = args.get("entityId") or args.get("playerId")
+            if not playerId:
+                return
+            if time.time() - self._itemGuard.get(playerId, 0.0) < 0.6:
+                args["cancel"] = True
+                print("[RandomBox] cancel place for %s" % playerId)
+        except Exception as e:
+            print("[RandomBox] try place error:", e)
 
     def _OpenChest(self, playerId, dim, x, y, z):
         key, state = self._EnsureChest(dim, x, y, z, seed=True)
@@ -968,11 +1255,19 @@ class RandomBoxServerSystem(ServerSystem):
                 return
             if action == "push":
                 self._PushAfterOpen(playerId)
+                # 面板常驻在容器界面上，开界面即同步许愿状态
+                self._SendWishState(playerId)
                 print("[RandomBox] screen push for %s" % playerId)
             elif action == "pop":
-                key = self._openChest.pop(playerId, None)
+                key = self._openChest.get(playerId)
+                # 关界面前补一次回读，避免最后 0.25s 内的改动（放/取物品）丢失
+                self._SyncOpenContainer(playerId)
+                self._SyncSpecials(playerId)
+                self._openChest.pop(playerId, None)
                 self._openTime.pop(playerId, None)
                 self._syncPending.discard(playerId)
+                # 关界面时献祭格里残留的物品自动退回背包，避免丢失
+                self._ReturnSacStash(playerId)
                 # 关闭界面后再切换满/未满外观，避免打断正在使用的容器
                 if key:
                     self._AnimClosed(key)
@@ -985,7 +1280,7 @@ class RandomBoxServerSystem(ServerSystem):
     # ---------- 容器界面数据维护 ----------
     def _PushBagToUI(self, playerId, bag):
         comp = CompFactory.CreateItem(playerId)
-        for slot in range(MAX_SLOTS):
+        for slot in range(CHEST_SLOTS):
             it = None
             src = bag.get(str(slot)) if isinstance(bag, dict) else None
             if isinstance(src, dict) and _ItemName(src):
@@ -995,12 +1290,19 @@ class RandomBoxServerSystem(ServerSystem):
             except Exception as e:
                 print("[RandomBox] SetPlayerUIItem error:", e)
                 return False
+        # 献祭格恢复本次已放入的物品
+        stash = self._sacStash.get(playerId)
+        sac = self._CleanItem(stash) if isinstance(stash, dict) and _ItemName(stash) else None
+        try:
+            comp.SetPlayerUIItem(playerId, SAC_SLOT, sac, False, True)
+        except Exception as e:
+            print("[RandomBox] push sac slot error:", e)
         return True
 
     def _ReadUIContainer(self, playerId):
         comp = CompFactory.CreateItem(playerId)
         bag = {}
-        for slot in range(MAX_SLOTS):
+        for slot in range(CHEST_SLOTS):
             try:
                 it = comp.GetPlayerUIItem(playerId, slot, True, True)
             except Exception as e:
@@ -1045,8 +1347,58 @@ class RandomBoxServerSystem(ServerSystem):
         self._syncPending.discard(playerId)
         try:
             self._SyncOpenContainer(playerId)
+            self._SyncSpecials(playerId)
         except Exception as e:
             print("[RandomBox] sync error:", e)
+
+    def _SyncSpecials(self, playerId):
+        """读取献祭格（第 28 格）：镜像到内存，关界面时据此退回背包"""
+        if not self._openChest.get(playerId):
+            return
+        comp = CompFactory.CreateItem(playerId)
+        sacIt = None
+        ok = True
+        try:
+            sacIt = comp.GetPlayerUIItem(playerId, SAC_SLOT, True, True)
+        except Exception as e:
+            ok = False
+            print("[RandomBox] read sac slot error:", e)
+        if ok:
+            if isinstance(sacIt, dict) and _ItemName(sacIt):
+                self._sacStash[playerId] = self._CleanItem(sacIt)
+            else:
+                self._sacStash.pop(playerId, None)
+
+    def OnWishSet(self, args):
+        """客户端在奖池弹窗里选定许愿物品"""
+        try:
+            playerId = args.get("playerId")
+            name = args.get("item") or ""
+            if not playerId or not name:
+                return
+            self._SetWishItem(playerId, name)
+        except Exception as e:
+            print("[RandomBox] wish set error:", e)
+
+    def _SetWishItem(self, playerId, name):
+        """设置许愿目标（指针语义：不影响已有概率与献祭记录）"""
+        if not isinstance(name, _STRING_TYPES) or not name:
+            return
+        if name not in self._EnsurePool():
+            self._Notify(playerId, "[随机箱子] %s 不在奖池中，无法许愿"
+                         % (self._ItemCn(name) or name))
+            self._SendWishState(playerId)
+            return
+        if name == (self._wish.get("item") or ""):
+            self._SendWishState(playerId)
+            return
+        self._wish["item"] = name
+        self._SaveWish()
+        prob, cap = self._WishProb()
+        self._Notify(playerId,
+                     "[随机箱子] 许愿物品已设为 %s（当前概率 %s%%/%d%%）"
+                     % (self._ItemCn(name) or name, _FmtPct(prob), cap))
+        self._SendWishState(playerId)
 
     def _OnContainerChanged(self, args):
         try:
@@ -1085,8 +1437,8 @@ class RandomBoxServerSystem(ServerSystem):
                 state["day"] = day
                 bag = self._Bag(state)
                 got = 0
-                while len(bag) < MAX_SLOTS and got < ITEMS_PER_DAY:
-                    self._BagAdd(bag, self._RollItem())
+                while len(bag) < CHEST_SLOTS and got < ITEMS_PER_DAY:
+                    self._BagAdd(bag, self._RollDaily())
                     got += 1
                 state["bag"] = bag
                 self._dirty = True
@@ -1112,7 +1464,7 @@ class RandomBoxServerSystem(ServerSystem):
             try:
                 self._PushBagToUI(playerId, bag)
                 self._Notify(playerId, "[随机箱子] +1个物品 (%d/%d)" %
-                             (len(bag), MAX_SLOTS))
+                             (len(bag), CHEST_SLOTS))
             except Exception as e:
                 print("[RandomBox] push open player error:", e)
 

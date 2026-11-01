@@ -74,6 +74,8 @@ POOL = [
     "minecraft:respawn_anchor", "minecraft:conduit", "minecraft:sea_lantern",
     "minecraft:glass_bottle", "minecraft:fermented_spider_eye",
     "minecraft:glistering_melon_slice", "minecraft:rabbit_stew",
+    # ---- 模组物品 ----
+    "randombox:random_box",
 ]
 
 NON_STACKABLE = {
@@ -93,8 +95,9 @@ NON_STACKABLE = {
 }
 
 
-# 本模组自己的方块不进奖池，避免“箱子开出另一个箱子”
-OWN_ITEMS = ("randombox:random_box",)
+# 满箱方块仅是外观状态不进奖池；普通随机箱子保留在奖池中，
+# 配方已删除，箱子本体只能通过每日随机获取
+OWN_ITEMS = ("randombox:random_box_full",)
 
 # 技术/内部条目：不是正常可获得物品，抽到只会得到空气、流水之类
 EXCLUDE_EXACT = {
@@ -161,14 +164,8 @@ def BuildPool(itemIds):
     return pool
 
 
-def RollItem(pool=None, stackSize=None):
-    """随机抽取一个物品，返回可直接用于 SpawnItemToPlayerInv 的物品字典
-
-    pool:      奖池（为空时使用后备 POOL）
-    stackSize: 可选回调，返回物品最大堆叠数；取不到时按 NON_STACKABLE 兜底
-    """
-    source = pool or POOL
-    name = random.choice(source)
+def MakeItem(name, stackSize=None):
+    """为指定物品生成 1~3 件的物品字典（不超过最大堆叠数）"""
     limit = 0
     if stackSize is not None:
         try:
@@ -179,3 +176,13 @@ def RollItem(pool=None, stackSize=None):
         limit = 1 if name in NON_STACKABLE else 3
     count = random.randint(1, min(3, limit))
     return {"newItemName": name, "newAuxValue": 0, "count": count}
+
+
+def RollItem(pool=None, stackSize=None):
+    """随机抽取一个物品，返回可直接用于 SpawnItemToPlayerInv 的物品字典
+
+    pool:      奖池（为空时使用后备 POOL）
+    stackSize: 可选回调，返回物品最大堆叠数；取不到时按 NON_STACKABLE 兜底
+    """
+    source = pool or POOL
+    return MakeItem(random.choice(source), stackSize)
